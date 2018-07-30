@@ -1,0 +1,32 @@
+{
+  "name": "monitorchain-interface-library",
+  "version": "1.0.0",
+  "description": "NodeJS libraries for interfacing and integrating MonitorChain by subscribers. ",
+  "homepage": "https://monitorchain.com",
+  "main": "src/interface.js",
+  "author": " Alex Mekh",
+  "license": "GPL-2.0",
+  "keywords": [
+    "monitorchain",
+    "monitor",
+    "block explorer",
+    "solidity",
+    "ethereum",
+    "smart contract security",
+    "blockchain security"
+  ],
+  "dependencies": {
+    "big-integer": "^1.6.32",
+    "solc": "^0.4.24",
+    "truffle-hdwallet-provider": "0.0.5",
+    "web3": "^1.0.0-beta.34"
+  },
+  "scripts": {
+    "test": "mocha --timeout 20000",
+    "postinstall": "node src/compile.js"
+  },
+  "devDependencies": {
+    "ganache-cli": "^6.1.6",
+    "mocha": "^5.2.0"
+  }
+}
