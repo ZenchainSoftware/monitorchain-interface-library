@@ -1,10 +1,10 @@
 {
   "name": "monitorchain-interface-library",
   "version": "1.0.0",
-  "description": "NodeJS libraries for interfacing and integrating MonitorChain by subscribers. ",
+  "description": "NodeJS libraries for interfacing and integrating MonitorChain by subscribers.",
   "homepage": "https://monitorchain.com",
   "main": "src/interface.js",
-  "author": " Alex Mekh",
+  "author": " Alexandr Mekh",
   "license": "GPL-2.0",
   "keywords": [
     "monitorchain",
@@ -20,6 +20,10 @@
     "solc": "^0.4.24",
     "truffle-hdwallet-provider": "0.0.5",
     "web3": "^1.0.0-beta.34"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ZenchainSoftware/monitorchain-interface-library.git"
   },
   "scripts": {
     "test": "mocha --timeout 20000",

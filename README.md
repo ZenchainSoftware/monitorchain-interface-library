@@ -1,5 +1,7 @@
+![MonitorChain Interface Library](https://monitorchain.com/wp-content/uploads/2018/07/Logo-MonitorChain2018-Dark-TextRight.png)
+
 ## monitorchain-interface-library
-Interface for accessing the MonitorChain smart contract methods
+NodeJS libraries for interfacing and integrating MonitorChain by subscribers.
 
 ## Install
 ```bash
@@ -106,13 +108,13 @@ const HDWalletProvider = require('truffle-hdwallet-provider');
 const Web3 = require('web3');
 
 const nodeAddress =  'http://localhost:8545';
-const monitorCainAddress = '0xF8CE9D27Ff65E59cc5499a44f3fd71337Bd6201a';
+const monitorChainAddress = '0xF8CE9D27Ff65E59cc5499a44f3fd71337Bd6201a';
 const mnemonic = '12 words mnemonic is here';
 
 const web3 = new Web3(new HDWalletProvider(mnemonic, nodeAddress, 0, 20));
 
 // A static method 'web3' allows to pass a custom web3 instance
-const mc = AccessInterface.web3(web3, monitorCainAddress);
+const mc = AccessInterface.web3(web3, monitorChainAddress);
 
 mc.getAllSupportedTokens(console.log);
 ```
@@ -121,18 +123,18 @@ mc.getAllSupportedTokens(console.log);
 ```javascript
 const {AccessInterface, ERC20Interface} = require('monitorchain-interface-library');
 const log = console.log;
-const monitorCainAddress = '0xF8CE9D27Ff65E59cc5499a44f3fd71337Bd6201a';
+const monitorChainAddress = '0xF8CE9D27Ff65E59cc5499a44f3fd71337Bd6201a';
 
 
 const mc = new AccessInterface(
     'http://localhost:8545',
-    monitorCainAddress,
+    monitorChainAddress,
     '12 words mnemonic is here'
 );
 
 const ws = new AccessInterface(
     'ws://localhost:8543',
-    monitorCainAddress
+    monitorChainAddress
 );
 
 const callback = async (err, result) => {
@@ -141,8 +143,8 @@ const callback = async (err, result) => {
     if (!tokenAddress) return; // return if a customer is not subscribed to token
 
     log(`${tokenAddress}: a status has been changed: ${result}`);
-    log(await mc.getErrorDetails(tokenAddress));
-    const token = new ERC20Interface(mc.w3, tokenAddress);
+    log(await mc.getCurrentStatusDetails(tokenAddress));
+    const token =ERC20Interface.web3(mc.w3, tokenAddress);
     const tokenInfo = await token.tokenInfo();
     log(JSON.stringify(tokenInfo, null, 4));
 };
@@ -150,7 +152,7 @@ const callback = async (err, result) => {
 ws.onStatusChanged(callback);
 ```
 ## Troubleshooting
-##### Transactions are too slow
+##### Error: Transactions are too slow
 Increase a gas price:
 ```javascript
 const {ERC20Interface} = require('monitorchain-interface-library');
@@ -160,7 +162,7 @@ token.gasPrice = 3; //gWei
 ...
 
 ```
-##### r: Exceeds block gas limit
+##### Error: Exceeds block gas limit
 Decrease the gasLimit:
 ```javascript
 const {ERC20Interface} = require('monitorchain-interface-library');
@@ -170,3 +172,13 @@ token.gasLimit = '3000000'
 ...
 
 ```
+
+#### Error: Cannot find module 'ethereumjs-wallet/hdkey'
+```bash
+$ npm uninstall ethereumjs-wallet
+$ npm install ethereumjs-wallet@0.6.0
+```
+
+## License
+
+[GPL-2.0](https://opensource.org/licenses/GPL-2.0 "GNU General Public License version 2")

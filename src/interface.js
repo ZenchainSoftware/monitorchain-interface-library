@@ -1,6 +1,6 @@
 /**
  * Interface for accessing the MonitorChain smart contract methods
- * Copyright (C) 2018,  Alexandr Mekh
+ * Copyright (C) 2018,  Zenchain Group Inc.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -607,6 +607,14 @@ class AccessInterface extends ContractFactory {
         [err, res] = await _to(this.subscribe(tokensList, numberOfDays, accessAddress, weiAmount));
         return returnValue(err, res, callback);
     }
+
+    async onStatusChanged(callback) {
+        if (!['ws', 'wss'].includes(this.protocol))
+            throw `Invalid protocol type - '${this.protocol}'! ` +
+            `Only the 'ws://' and 'wss://' protocols support listening for events.\n`;
+        this.events.TokenStatusChanged((err, r) => callback(err, r.returnValues.eventId))
+    }
+
 }
 
 module.exports = {
