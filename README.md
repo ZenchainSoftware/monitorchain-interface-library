@@ -1,4 +1,4 @@
-![MonitorChain Interface Library](https://monitorchain.com/wp-content/uploads/2018/07/Logo-MonitorChain2018-Dark-TextRight.png)
+![MonitorChain Interface Library](https://monitorchain.com/wp-content/uploads/2018/08/Logo-MonitorChain-BlueS.png)
 
 ## monitorchain-interface-library
 NodeJS libraries for interfacing and integrating MonitorChain by subscribers.
@@ -152,7 +152,7 @@ const callback = async (err, result) => {
 ws.onStatusChanged(callback);
 ```
 ## Troubleshooting
-##### Error: Transactions are too slow
+##### Transactions are too slow
 Increase a gas price:
 ```javascript
 const {ERC20Interface} = require('monitorchain-interface-library');

@@ -518,7 +518,7 @@ class AccessInterface extends ContractFactory {
         let toPay, result;
         [err, toPay] = await _to(this.calculatePrice(days, tokenAddresses.length));
         if (err) return returnValue(err, null, cb);
-        toPay = toPay.priceToPay;
+        toPay = toPay['0'];
         let amount = (weiAmount && typeof weiAmount !== 'function') ? bn(weiAmount) : bn(toPay);
 
         console.log(`Subscribe: number of tokens - ${tokenAddresses.length}, ` +
@@ -557,7 +557,7 @@ class AccessInterface extends ContractFactory {
         [err, toPay] = await _to(this.calculatePrice(days, 0));
         if (err) return returnValue(err, null, callback);
 
-        toPay = toPay.priceToPay;
+        toPay = toPay['0'];
         let amount = bn(weiAmount || toPay);
 
         if (amount.lt(bn(toPay))) {

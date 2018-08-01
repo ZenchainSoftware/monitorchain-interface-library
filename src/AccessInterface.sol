@@ -41,24 +41,24 @@ contract AccessInterface {
     function getTotalStatusCounts(address tokenAddress) view public returns (uint16 errorsCount);
     function getStatusLevel(address tokenAddress) view public returns (uint8 errorLevel);
     function getCurrentStatusDetails(address tokenAddress) view public returns (
-        uint8 errorLevel,
-        string errorMessage,
-        address setter,
-        uint timestamp);
+        uint8, // errorLevel,
+        string, // errorMessage,
+        address, // setter,
+        uint); // timestamp);
 
     function getStatusDetails(address tokenAddress, uint16 statusNumber) view public returns (
-        uint8 errorLevel,
-        string errorMessage,
-        address setter,
-        uint timestamp,
-        bool invalid);
+        uint8, // errorLevel,
+        string, // errorMessage,
+        address, // setter,
+        uint, // timestamp,
+        bool); // invalid);
 
     function getLastStatusDetails(address tokenAddress) view public returns (
-        uint8 errorLevel,
-        string errorMessage,
-        address setter,
-        uint timestamp,
-        bool invalid);
+        uint8, // errorLevel,
+        string, // errorMessage,
+        address, // setter,
+        uint, // timestamp,
+        bool); // invalid);
 
 
     function subscriptionIsValid() public view returns(bool isValid);
@@ -72,19 +72,19 @@ contract AccessInterface {
     function unsubscribe() public;
 
     function calculatePrice(uint numberOfDays, uint numberTokens) view public returns (
-        uint priceToPay,
-        uint averageDailyPrice,
-        uint remainingOverheadBalance);
+        uint, // priceToPay,
+        uint, // averageDailyPrice,
+        uint); // remainingOverheadBalance);
 
     function subscribe(address subscribee, uint numberOfDays, address[] tokenAddresses) public payable;
     function subscribeAll(address subscribee, uint numberOfDays) public payable;
 
     function getSubscriptionData() public view returns (
-        uint start,
-        uint numberOfDays,
-        uint dailyPrice,
-        uint overheadBalance,
-        address accessAddress);
+        uint, // start,
+        uint, // numberOfDays,
+        uint, // dailyPrice,
+        uint, // overheadBalance,
+        address); // accessAddress);
 
     event TokenStatusChanged(uint16 eventId);
 }
