@@ -67,6 +67,7 @@ contract AccessInterface {
     function canAccessToken(address token) public view returns (bool canAccess);
     function getNumberSupportedTokens() public view returns (uint numberOfTokens);
     function getAllSupportedTokens() public view returns (address[] allTokens);
+    function isAddressBlocked(address token, address addressToCheck) public view returns(bool);
 
     function remainingSubscriptionDays() public view returns (uint remainingDays);
     function unsubscribe() public;

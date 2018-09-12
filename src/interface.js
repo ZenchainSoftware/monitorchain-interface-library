@@ -58,7 +58,9 @@ class Web3 {
             throw "Error: the node address is not defined!";
 
         const supportedProtocols = ['ws', 'wss', 'http', 'https', 'ipc'];
-        const protocol = nodeAddress.split(':')[0];
+        let protocol;
+        if (nodeAddress.search(/\.ipc$/) !== -1) protocol = 'ipc';
+        else protocol = nodeAddress.split(':')[0];
 
         if (!supportedProtocols.includes(protocol))
             throw `"${protocol}" protocol is not supported! ` +
@@ -67,6 +69,7 @@ class Web3 {
         const providers = {
             https: Web3js.providers.HttpProvider,
             http: Web3js.providers.HttpProvider,
+            ipc: Web3js.providers.IpcProvider,
             wss: Web3js.providers.WebsocketProvider,
             ws: Web3js.providers.WebsocketProvider
         };
@@ -76,8 +79,7 @@ class Web3 {
         if (protocol === 'ipc') {
             web3 = new Web3js(new providers[protocol](nodeAddress, net));
         }
-
-        if (mnemonic) {
+        else if (mnemonic) {
             web3 = new Web3js(new HDWalletProvider(mnemonic, nodeAddress, 0, 20));
         } else {
             web3 = new Web3js(new providers[protocol](nodeAddress))
@@ -118,7 +120,7 @@ class ContractFactory {
         }
 
         this.walletIndex = 0;
-        this.accounts = null;
+        this.accounts = this.w3.currentProvider.addresses;
         this._gasPrice = toWei('3', 'gwei');
         this.gasLimit = '6000000';
         this._address = address;
@@ -217,9 +219,9 @@ class ERC20Interface extends ContractFactory{
     async transferFrom(from, to, value, callback) {
         await this.init();
         const [err, result] = await _to(this.contract.methods.transferFrom(
-                toChecksum(from),
-                toChecksum(to),
-                value)
+            toChecksum(from),
+            toChecksum(to),
+            value)
             .send({
                 from: this.wallet,
                 gas: this.gasLimit,
@@ -228,10 +230,10 @@ class ERC20Interface extends ContractFactory{
         return returnValue(err, result, callback);
     };
 
-    async approve(_spender, _value, callback) {
+    async approve(_spender, value, callback) {
         await this.init();
         const spender = toChecksum(_spender);
-        const [err, result] = await _to(this.contract.methods.approve(spender, _value)
+        const [err, result] = await _to(this.contract.methods.approve(spender, value)
             .send({
                 from: this.wallet,
                 gas: this.gasLimit,
@@ -243,31 +245,38 @@ class ERC20Interface extends ContractFactory{
     async allowance(owner, spender, callback) {
         await this.init();
         const [err, result] = await _to(this.contract.methods.allowance(
-                toChecksum(owner),
-                toChecksum(spender))
+            toChecksum(owner),
+            toChecksum(spender))
             .call());
         return returnValue(err, result, callback);
     };
 
     async tokenInfo (callback) {
-        let err, name, symbol, decimals, totalSupply;
+        let err, name, symbol, decimals, totalSupply, paused;
 
         [err, name] = await _to(this.name());
         [err, symbol] = await _to(this.symbol());
         [err, decimals] = await _to(this.decimals());
         [err, totalSupply] = await  _to(this.totalSupply());
+        [err, paused] = await _to(this.paused());
 
         const result =  {
             address: this._address,
             name: name,
             symbol: symbol,
-            decimals: decimals != null ? parseInt(decimals):18,
-            totalSupply: totalSupply || 0
+            decimals: decimals != null ? parseInt(decimals):0,
+            totalSupply: totalSupply || 0,
+            paused: paused
         };
 
         this.info = result;
 
         return returnValue(null, result, callback);
+    }
+
+    onEvent(eventName, callback) {
+        this.isWebSocket();
+        this.events[eventName](callback);
     }
 
     onTransfer(callback) {
@@ -317,6 +326,17 @@ class ERC20Interface extends ContractFactory{
         return returnValue(err, result, callback)
     };
 
+    async valueOfAtBlock (name, blockNumber, params, callback)  {
+        const block = parseInt(blockNumber);
+        let args = params;
+        if (typeof params === 'string') args = [params];
+        else if (params == null) args = [];
+
+        const [err, result] = await _to(this.contract.methods[name](...args)
+            .call("0x" + block.toString(16)));
+        return returnValue(err, result, callback)
+    };
+
     async totalSupplyAtBlock (blockNumber, callback) {
         const block = parseInt(blockNumber);
         const [err, result] = await _to(this.contract.methods.totalSupply().call("0x" + block.toString(16)));
@@ -342,6 +362,22 @@ class ERC20Interface extends ContractFactory{
         const [err, latestBlock] =  await _to(this.w3.eth.getBlock('latest'));
         if(err) return returnValue(err, null, callback);
         return returnValue(err, latestBlock.number, callback);
+    }
+
+    async methods(method, params, callback) {
+        await this.init();
+        let args = params;
+        if (typeof params === 'string') args = [params];
+        else if (params == null) args = [];
+
+        const [err, result] = await _to(this.contract.methods[method](...args)
+            .send({
+                from: this.wallet,
+                gas: this.gasLimit,
+                gasPrice: this.gasPrice
+            }));
+
+        return returnValue(err, result, callback);
     }
 }
 
@@ -521,10 +557,6 @@ class AccessInterface extends ContractFactory {
         toPay = toPay['0'];
         let amount = (weiAmount && typeof weiAmount !== 'function') ? bn(weiAmount) : bn(toPay);
 
-        console.log(`Subscribe: number of tokens - ${tokenAddresses.length}, ` +
-            `wei amount: ${amount} ` +
-            `eth amount: ${this.w3.utils.fromWei(amount.toString(), 'ether')}`);
-
         if (amount.lt(bn(toPay))) {
             throw (`Not enough wei to pay. The minimum required amount is ${toPay}`);
         }
@@ -608,11 +640,20 @@ class AccessInterface extends ContractFactory {
         return returnValue(err, res, callback);
     }
 
-    async onStatusChanged(callback) {
+    async isAddressBlocked(token, addressToCheck, callback) {
+        await this.init();
+        const [err, result] = await _to(this.contract.methods.isAddressBlocked(
+            toChecksum(token),
+            toChecksum(addressToCheck))
+            .call({from: this.wallet}));
+        return returnValue(err, result, callback);
+    }
+
+    onStatusChanged(callback) {
         if (!['ws', 'wss'].includes(this.protocol))
             throw `Invalid protocol type - '${this.protocol}'! ` +
             `Only the 'ws://' and 'wss://' protocols support listening for events.\n`;
-        this.events.TokenStatusChanged((err, r) => callback(err, r.returnValues.eventId))
+        this.events.TokenStatusChanged(callback);
     }
 
 }
