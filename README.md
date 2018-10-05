@@ -149,7 +149,7 @@ const callback = async (err, result) => {
     log(JSON.stringify(tokenInfo, null, 4));
 };
 
-ws.onStatusChanged(callback);
+ws.onTokenStatusChanged(callback);
 ```
 ## Troubleshooting
 ##### Transactions are too slow

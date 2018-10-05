@@ -28,7 +28,7 @@ const web3 = new Web3(ganache.provider());
 
 const tokenContract = './test/token.sol';
 
-let token, deployed, accounts;
+let token, accounts;
 
 const toWei = (amount, unit) => {
     return Web3.utils.toWei(amount.toString(), unit);
@@ -45,18 +45,14 @@ const compile = async () => {
 before(async () => {
     accounts = await web3.eth.getAccounts();
     const compiled = await compile();
-    const tokenContract = await new web3.eth.Contract(compiled.abi);
-    const account = accounts[0];
 
-    deployed = await tokenContract
-        .deploy({ data: compiled.bytecode })
-        .send({from: account, gas: '6000000'});
-    token = ERC20.web3(web3, deployed.options.address);
+    token = ERC20.web3(web3, null, compiled.abi);
+    await token.deploy({bytecode: compiled.bytecode});
 });
 
 describe ('ERC20', () => {
     it('deploys a contract', () => {
-        assert.ok(deployed.options.address);
+        assert.ok(token.address);
     });
 
     it('name', async () => {

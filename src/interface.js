@@ -19,11 +19,40 @@
 
 const Web3js = require('web3');
 const HDWalletProvider = require('truffle-hdwallet-provider');
+const EventEmitter = require('events');
 const net = require('net');
-const monitorChainAbi = require('./AccessInterface');
+const Mutex = require('await-semaphore').Mutex;
+const extend = require('xtend');
+const monitor = require('./AccessInterface');
 const erc20 = require('./ERC20');
 const bn = require('big-integer');
 
+EventEmitter.defaultMaxListeners = 5000;
+
+let log;
+try {
+    const logger = require('./logger');
+    log = logger(module);
+} catch (e) {
+    if(e.code !== 'MODULE_NOT_FOUND') throw(e);
+    const isDebug = process.env.LOG_LEVEL === 'debug';
+    log = new Proxy({}, {
+        get: function (obj, prop) {
+            return function(message) {
+                message = `[${(new Date()).toISOString()}] [${prop}] ${message}`;
+                if(isDebug) console.log(message)
+            }
+        }
+    })
+}
+
+const returnValue = (err, result, callback) => {
+    if (typeof callback === 'function') {
+        return callback(err, result)
+    }
+    if (err) throw err;
+    return result
+};
 
 const toChecksum = (address) => {
     return Web3js.utils.toChecksumAddress(address)
@@ -35,20 +64,355 @@ const toWei = (amount, unit) => {
 };
 
 
-const _to = (promise) => {
-    return promise.then(data => {
-        return [null, data];
-    })
-        .catch(err => [err, null]);
+const fromWei = (amount, unit) => {
+    return Web3js.utils.fromWei(amount.toString(), unit);
 };
 
 
-const returnValue = (err, result, callback) => {
-    if (typeof callback === 'function') {
-        return callback(err, result)
+function _to (promise) {
+    return promise
+        .then(data => [null, data])
+        .catch(err => [err, null]);
+}
+
+const sleep = (ms) => {
+    return new Promise(resolve => setTimeout(resolve, ms));
+};
+
+const transactions = {
+    tx: [],
+    totalGasUsed: bn.zero,
+    totalEthSpent: 0,
+    _lockMap: {},
+    _idCounter: Math.round(Math.random() * Number.MAX_SAFE_INTEGER),
+    addTx: function(args) {
+        args.id = args.id || this._createRandomId();
+        args.time = (new Date()).getTime();
+        args.status = args.status || 'pending';
+        this.tx.push(args);
+        return args.id;
+    },
+
+    getFailedTransactions: function getFailedTransactions(address) {
+        const filter = {status: 'failed'};
+        if(address) filter.address  = address;
+        return this.getFilteredTxList(filter)
+    },
+
+    getConfirmedTransactions: function getConfirmedTransactions(address) {
+        const filter = {status: 'confirmed'};
+        if(address) filter.address  = address;
+        return this.getFilteredTxList(filter)
+    },
+
+    getPendingTransactions: function getPendingTransactions(address) {
+        const filter = {status: 'pending'};
+        if(address) filter.address  = address;
+        return this.getFilteredTxList(filter)
+    },
+
+    getSubmittedTransactions: function getSubmittedTransactions(address) {
+        const filter = {status: 'submitted'};
+        if(address) filter.address  = address;
+        return this.getFilteredTxList(filter)
+    },
+
+    getFilteredTxList: function getFilteredTxList(opts, initialList) {
+        let filteredTxList = initialList;
+        Object.keys(opts).forEach((key) => {
+            filteredTxList = this.getTxsByMetaData(key, opts[key], filteredTxList)
+        });
+        return filteredTxList
+    },
+
+    getTxsByMetaData: function getTxsByMetaData(key, value, txList = this.tx) {
+        return txList.filter(txMeta => txMeta[key] === value)
+    },
+
+    updateTx: function updateTx(txMeta) {
+        const index = this.tx.findIndex(tx => tx.id === txMeta.id);
+        log.debug(`updateTx: ${txMeta.id} -> ${index} -> ${JSON.stringify(txMeta)}`);
+        this.tx[index] = txMeta;
+    },
+
+    getTxMeta: async function getTxMeta() {
+        const args = [].slice.call(arguments);
+        const obj = args.shift();
+        const method = args.shift();
+
+        const lastArg = args[args.length - 1];
+        const lastArgType = typeof lastArg;
+        const isObject = (lastArgType === 'function' || lastArgType === 'object' && !!lastArg) && !Array.isArray(lastArg);
+
+        let options = {};
+        if(isObject) {
+            options = args.pop();
+        }
+        options.from = options.from || obj.wallet;
+        let txType;
+
+        if(obj._sent.includes(method)) {
+            options.gas = options.gas || obj.gasLimit || '6000000';
+            options.gasPrice = options.gasPrice || obj.gasPrice;
+            const gasPrice = await obj.w3.eth.getGasPrice();
+            if(!options.gasPrice) {
+                options.gasPrice = Math.ceil(parseInt(gasPrice) * 1.2);
+            } else if(parseInt(gasPrice) > options.gasPrice) {
+                log.warn(`the gas price is too low: blockchain - ${fromWei(gasPrice, 'gwei')}, TxObject - ${fromWei(options.gasPrice, 'gwei')} (GWEI)`)
+            }
+            txType = 'send';
+        } else if(obj._call.includes(method)){
+            txType = 'call';
+        }
+
+        return {
+            address: options.from,
+            method: method,
+            methodArgs: args,
+            options: options,
+            txType: txType
+        }
+    },
+
+    getNonce: async function getNonce(obj) {
+        const address = obj.wallet;
+        const releaseNonceLock = await this._getLock(address);
+        try {
+            const block = await obj.w3.eth.getBlock('latest');
+            const blockNumber = block.number;
+            const nextNetworkNonce = await obj.w3.eth.getTransactionCount(address, blockNumber);
+            const highestLocallyConfirmed = this._getHighestLocallyConfirmed(address);
+
+            const highestSuggested = Math.max(nextNetworkNonce, highestLocallyConfirmed);
+
+            const pendingTxs = this.getSubmittedTransactions(address);
+            const localNonceResult = this._getHighestContinuousFrom(pendingTxs, highestSuggested) || 0;
+
+            const nonceDetails = {
+                localNonceResult,
+                highestLocallyConfirmed,
+                highestSuggested,
+                nextNetworkNonce,
+            };
+
+            const nextNonce = Math.max(nextNetworkNonce, localNonceResult);
+
+            const data = { nextNonce, nonceDetails, releaseNonceLock };
+            log.debug(`getNonce: ${JSON.stringify(nonceDetails)}`);
+
+            return data
+
+        } catch (err) {
+            log.error(`getNonce error: ${err}`);
+            releaseNonceLock();
+            throw err
+        }
+
+    },
+
+    submitTx: async function sendTx(obj, txMeta, lock=false) {
+        let err, result, releaseTxLock;
+
+        const { method, methodArgs, options, txType } = txMeta;
+        if(txType === 'call') {
+            [err, result] = await _to(obj.contract.methods[method](...methodArgs).call(options));
+            return [err, result]
+        }
+        log.debug(JSON.stringify(this.getTxStat('submitTxIN')));
+
+        await this._globalLockFree();
+        releaseTxLock = lock ? await this._getLock(txMeta.address) : () => {};
+
+        txMeta.id = this.addTx(txMeta);
+
+        let { nextNonce, nonceDetails, releaseNonceLock } = await this.getNonce(obj);
+        let awaiting = this.getSubmittedTransactions().length;
+        let pending = this.getPendingTransactions().length;
+        const awaitLimit = 100;
+        const awaitTime = 10; //seconds
+        if(txType === 'send' && awaiting >= awaitLimit) {
+            while(awaiting > awaitLimit) {
+                log.debug(`Too many transactions are waiting to be mined: submitted - ${awaiting}, pending - ${pending}, sleeping ${awaitTime} seconds...`);
+                await sleep(awaitTime * 1000);
+                awaiting = this.getSubmittedTransactions().length;
+                pending = this.getPendingTransactions().length;
+            }
+        }
+
+        try {
+            if(txType === 'send') {
+                txMeta.nonce = nextNonce;
+                txMeta.status = 'submitted';
+                this.updateTx(txMeta);
+
+                options.nonce = nextNonce;
+                releaseNonceLock();
+                log.debug(JSON.stringify({
+                    id: txMeta.id,
+                    contractAddress: obj.address,
+                    method: method,
+                    args: methodArgs,
+                    options: options,
+                    nonceDetails: nonceDetails,
+                    submitSendTxMeta: txMeta
+                }));
+                log.debug(JSON.stringify(this.getTxStat(txMeta.id)));
+
+                try {
+                    result = await obj.contract.methods[method](...methodArgs).send(options);
+                } catch(e) { err = e }
+
+            } else {
+                err = Error(`proxyHandler: Unsupported method "${method}"`);
+            }
+
+            const totalGasUsed = obj.totalGasUsed || 0;
+            obj.gasUsed = result ? result.gasUsed || 0 : 0;
+            obj.totalGasUsed = bn(totalGasUsed).add(bn(obj.gasUsed)).toString();
+
+            this.updateStat(obj.gasUsed, txMeta.options.gasPrice)
+
+        } catch(e) {
+            err = e;
+            releaseTxLock();
+            releaseNonceLock();
+            log.error(`submitTx failed: ${JSON.stringify(txMeta)}\n${e}`)
+        }
+
+        if(!err) {
+            log.debug(`submitTx: CONFIRMED - ${txMeta.id} `);
+            txMeta.status = 'confirmed';
+        }
+        else {
+            log.error(`submitTx: FAILED - ${txMeta.id}, ${err}`);
+            txMeta.status = 'failed';
+        }
+        txMeta.gasUsed = obj.gasUsed;
+        txMeta.totalGasUsed = obj.totalGasUsed;
+
+        this.updateTx(txMeta);
+        const message = JSON.stringify(this.getTxStat('submitTxOUT'));
+        if(err) {
+            log.warn(message);
+        } else {
+            log.debug(message);
+        }
+
+        releaseTxLock();
+        return [err, result]
+    },
+
+    getTxStat: function getTxStat (id) {
+        let data = {};
+        if(id) data.id = id;
+
+        return extend(
+            data, {
+                submitted: this.getSubmittedTransactions().length,
+                pending: this.getPendingTransactions().length,
+                failed: this.getFailedTransactions().length,
+                confirmed: this.getConfirmedTransactions().length,
+                totalGasUsed: this.totalGasUsed.toString(),
+                totalEthSpent: this.totalEthSpent.toString()
+            })
+    },
+
+    updateStat: function updateStat(gasUsed, gasPrice) {
+        const weiSpent =  bn(gasUsed).multiply(bn(gasPrice)).toString();
+        this.totalGasUsed = this.totalGasUsed.add(bn(gasUsed));
+        this.totalEthSpent = this.totalEthSpent + parseFloat(fromWei(weiSpent, 'ether'));
+
+    },
+
+    _getHighestLocallyConfirmed: function (address) {
+        const confirmedTransactions = this.getConfirmedTransactions(address);
+        const highest = this._getHighestNonce(confirmedTransactions);
+        log.debug(`_getHighestLocallyConfirmed: ${address} -> ${highest}`);
+        return Number.isInteger(highest) ? highest + 1 : 0
+    },
+
+    _getHighestContinuousFrom: function (txList, startPoint) {
+        const nonces = txList.map(txMeta => txMeta.nonce);
+
+        let highest = startPoint;
+        while (nonces.includes(highest)) {
+            highest++
+        }
+        log.debug(`_getHighestContinuousFrom:  ${startPoint} -> ${highest}`);
+
+        return highest
+    },
+
+    _getHighestNonce: function (txList) {
+        const nonces = txList.map(txMeta => txMeta.nonce);
+        return Math.max.apply(null, nonces)
+    },
+
+    _getLock: async function getLock (address) {
+        const mutex = this._lookupMutex(address);
+        return mutex.acquire()
+    },
+
+    _getGlobalLock: async function getGlobalLock () {
+        log.debug(`_getGlobalLock`);
+        const globalMutex = this._lookupMutex('global');
+        const releaseLock = await globalMutex.acquire();
+        return { releaseLock }
+    },
+
+    _lookupMutex: function lookupMutex (lockId) {
+        let mutex = this._lockMap[lockId];
+        if (!mutex) {
+            mutex = new Mutex();
+            this._lockMap[lockId] = mutex
+        }
+        return mutex;
+    },
+
+    _globalLockFree: async function globalMutexFree () {
+        const globalMutex = this._lookupMutex('global');
+        const releaseLock = await globalMutex.acquire();
+        releaseLock()
+    },
+
+    _createRandomId: function createRandomId() {
+        this._idCounter = this._idCounter % Number.MAX_SAFE_INTEGER;
+        return this._idCounter++
     }
-    if (err) throw err;
-    return result
+};
+
+
+const proxyHandler = {
+    get: function ptoxyGet (obj, prop) {
+        if(!obj.proxyMethods.includes(prop)) return obj[prop];
+        if(prop in obj) return obj[prop];
+
+        let isEvent = obj._events.includes(prop);
+
+        if(isEvent) {
+            const event = prop.split(/^on/)[1];
+            obj[prop] = function proxyAddEvent (callback) {
+                if(!callback || typeof callback !== 'function')
+                    throw new Error('A callback must be a function!');
+                obj.events[event](callback)
+            };
+            return obj[prop];
+        }
+
+        obj[prop] = async function proxyAddProp () {
+            let err, result;
+            const args = [].slice.call(arguments);
+
+            const callback = typeof args[args.length - 1] === 'function' ? args[args.length - 1] : null;
+            if(callback) args.pop();
+
+            const meta = await transactions.getTxMeta(obj, prop, ...args);
+            [err, result] = await transactions.submitTx(obj, meta);
+            return returnValue(err, result, callback);
+        };
+
+        return obj[prop]
+    }
 };
 
 
@@ -91,45 +455,44 @@ class Web3 {
 }
 
 
-
-class ContractInterface {
-    constructor(web3, contractAddress, abi) {
-        this._address = toChecksum(contractAddress);
-        this._abi = abi;
-        this.contract = new web3.eth.Contract(this._abi, this._address);
-        this.methods = this.contract.methods;
-    }
-}
-
-
-class ContractFactory {
-    constructor (nodeAddress, contractAddress, abi, mnemonic, web3Instance) {
-        const address = toChecksum(contractAddress);
-
+class ContractInterface  extends EventEmitter {
+    constructor (nodeAddress, contractAddress, mnemonic, abi, web3Instance) {
+        super();
         if (web3Instance) {
             this.w3 = web3Instance;
-            this.contract = new ContractInterface(this.w3, address, abi);
-
         } else {
-            if (!nodeAddress || !contractAddress)
-                throw "The node address and/or the MonitorChain contract's address is/are not defined!";
+            if (!nodeAddress)
+                throw "The node address is not defined!";
             this.protocol = nodeAddress.split(':')[0];
-
             this.w3 = new Web3(nodeAddress, mnemonic);
-            this.contract = new ContractInterface(this.w3, address, abi);
         }
 
-        this.walletIndex = 0;
-        this.accounts = this.w3.currentProvider.addresses;
-        this._gasPrice = toWei('3', 'gwei');
+        this.contract = new this.w3.eth.Contract(abi);
+        this.methods = this.contract.methods;
+        this.events = this.contract.events;
+
+        if(contractAddress) {
+            this._address = toChecksum(contractAddress);
+            this.at(this._address);
+        }
+
+        this._abi = abi;
+        this._gasPrice = null;
         this.gasLimit = '6000000';
-        this._address = address;
+        this.accounts = this.w3.currentProvider.addresses;
+        this.walletIndex = 0;
+
+        const _callStates = ['pure', 'view'];
+        this._sent = this._abi.filter(item => !_callStates.includes(item.stateMutability) && item.type === 'function').map(item => item.name);
+        this._call = this._abi.filter(item => _callStates.includes(item.stateMutability) && item.type === 'function').map(item => item.name);
+        this._events = this._abi.filter(item => item.type === 'event').map(item => 'on' + item.name);
+        this.proxyMethods = this._sent.concat(this._call).concat(this._events);
     }
 
     get wallet() {
         if (!this.accounts)
-            throw "The wallet has not been initialized yet. Call the 'init' method before accessing to the accounts.";
-        return this.accounts[this.walletIndex]
+            return;
+        return toChecksum(this.accounts[this.walletIndex])
     }
 
     set wallet(index) {
@@ -137,119 +500,106 @@ class ContractFactory {
     }
 
     set gasPrice(price) {
-        this._gasPrice = toWei(price.toString(), 'gwei');
+        if(!price || Number(parseFloat(price)) !== price)
+            this._gasPrice = null;
+        else
+            this._gasPrice = toWei(price.toString(), 'gwei');
     }
 
     get gasPrice() {
         return this._gasPrice;
     }
 
-    async init() {
-        if (!this.accounts) {
-            this.accounts = await this.w3.eth.getAccounts();
-        }
+    get address() {
+        return this._address;
     }
+
+    set address(address) {
+        this.at(address)
+    }
+
+    get abi() {
+        return this.contract.options.jsonInterface;
+    }
+
+    set abi(abi) {
+        this.contract.options.jsonInterface = abi;
+    }
+
+    at(address) {
+        this._address = address;
+        this.contract.options.address = toChecksum(address);
+        return this;
+    }
+
+    async init() {
+        if (!this.accounts) this.accounts = await this.w3.eth.getAccounts();
+    }
+
+    async getGasPrice(multiplier) {
+        multiplier = multiplier || 1.2;
+        const gasPrice = await this.w3.eth.getGasPrice();
+        return Math.floor(gasPrice * multiplier);
+    }
+
+
+    async deploy(args, callback) {
+        args = args || {};
+        const bytecode = args.bytecode || this.bytecode;
+        const contractArguments = args.args || [];
+        await this.init();
+        const blockGasPrice = await this.getGasPrice(1);
+        const gasPrice = this.gasPrice || await this.getGasPrice();
+        if(parseInt(blockGasPrice) > gasPrice) {
+            log.warn(`the gas price is too low: ` +
+                `blockchain - ${fromWei(blockGasPrice, 'gwei')}, ` +
+                `TxObject - ${fromWei(gasPrice, 'gwei')} (GWEI)`)
+        }
+
+        const params = {
+            from: this.wallet,
+            gas: this.gasLimit,
+            gasPrice: gasPrice
+        };
+        if(args.nonce) params.nonce = args.nonce;
+
+        const [err, result] = await _to(this.contract.deploy({data: bytecode, arguments: contractArguments})
+            .send(params)
+            .once('transactionHash', (hash) => log.debug(` Tx hash: ${hash}`))
+            .once('confirmation', (num, rec) => {
+                log.debug(` address ${rec.contractAddress}`);
+
+                let weiSpent = bn(rec.gasUsed).multiply(bn(gasPrice)).toString();
+
+                if(rec) transactions.updateStat(rec.gasUsed, gasPrice);
+
+                log.debug(JSON.stringify({
+                    deploy: {
+                        gasUsed: rec.gasUsed,
+                        gasPrice: gasPrice,
+                        weiSpent: weiSpent,
+                        totalEthSpent: transactions.totalEthSpent
+                    }
+                }));
+            }));
+        this.at(result.options.address);
+        returnValue(err, result, callback);
+    };
 }
 
-class ERC20Interface extends ContractFactory{
-    constructor(nodeAddress, tokenAddress, mnemonic, web3Instance, _abi) {
+
+class ERC20Interface extends ContractInterface{
+    constructor(nodeAddress, tokenAddress, mnemonic, web3Instance, _abi, _bytecode) {
         const abi = _abi || erc20;
-        super(nodeAddress, tokenAddress, abi, mnemonic, web3Instance);
-        this.events = this.contract.contract.events;
+        super(nodeAddress, tokenAddress, mnemonic, abi, web3Instance);
+        this.bytecode = _bytecode;
         this.supportedEvents = abi.filter(item => item.type === 'event').map(item => item.name);
+        return new Proxy(this, proxyHandler);
     }
 
     static web3 (web3Instance, contractAddress, abi) {
         return new ERC20Interface(null, contractAddress, null, web3Instance, abi)
     }
-
-    async name(callback) {
-        const [err, result] = await _to(this.contract.methods.name().call());
-        return returnValue(err, result, callback);
-    }
-
-    async symbol(callback) {
-        const [err, result] = await _to(this.contract.methods.symbol().call());
-        return returnValue(err, result, callback);
-    }
-
-    async decimals(callback) {
-        const [err, result] = await _to(this.contract.methods.decimals().call());
-        return returnValue(err, result, callback);
-    }
-
-    async totalSupply(callback) {
-        const [err, result] = await _to(this.contract.methods.totalSupply().call());
-        return returnValue(err, result, callback);
-    }
-
-    async balanceOf(holder, callback) {
-        const [err, result] = await _to(this.contract.methods.balanceOf(
-            toChecksum(holder)
-        ).call());
-        return returnValue(err, result, callback);
-    }
-
-    async cap(callback) {
-        const [err, result] = await _to(this.contract.methods.cap().call());
-        return returnValue(err, result, callback);
-    }
-
-    async mintingFinished(callback) {
-        const [err, result] = await _to(this.contract.methods.mintingFinished().call());
-        return returnValue(err, result, callback);
-    }
-
-    async paused(callback) {
-        const [err, result] = await _to(this.contract.methods.paused().call());
-        return returnValue(err, result, callback);
-    }
-
-    async transfer(to, _value, callback) {
-        await this.init();
-        const [err, result] = await _to(this.contract.methods.transfer(toChecksum(to), _value)
-            .send({
-                from: this.wallet,
-                gas: this.gasLimit,
-                gasPrice: this.gasPrice
-            }));
-        return returnValue(err, result, callback);
-    };
-
-    async transferFrom(from, to, value, callback) {
-        await this.init();
-        const [err, result] = await _to(this.contract.methods.transferFrom(
-            toChecksum(from),
-            toChecksum(to),
-            value)
-            .send({
-                from: this.wallet,
-                gas: this.gasLimit,
-                gasPrice: this.gasPrice
-            }));
-        return returnValue(err, result, callback);
-    };
-
-    async approve(_spender, value, callback) {
-        await this.init();
-        const spender = toChecksum(_spender);
-        const [err, result] = await _to(this.contract.methods.approve(spender, value)
-            .send({
-                from: this.wallet,
-                gas: this.gasLimit,
-                gasPrice: this.gasPrice
-            }));
-        return returnValue(err, result, callback);
-    };
-
-    async allowance(owner, spender, callback) {
-        await this.init();
-        const [err, result] = await _to(this.contract.methods.allowance(
-            toChecksum(owner),
-            toChecksum(spender))
-            .call());
-        return returnValue(err, result, callback);
-    };
 
     async tokenInfo (callback) {
         let err, name, symbol, decimals, totalSupply, paused;
@@ -265,8 +615,8 @@ class ERC20Interface extends ContractFactory{
             name: name,
             symbol: symbol,
             decimals: decimals != null ? parseInt(decimals):0,
-            totalSupply: totalSupply || 0,
-            paused: paused
+            totalSupply: totalSupply || '0',
+            paused: paused || false
         };
 
         this.info = result;
@@ -277,46 +627,6 @@ class ERC20Interface extends ContractFactory{
     onEvent(eventName, callback) {
         this.isWebSocket();
         this.events[eventName](callback);
-    }
-
-    onTransfer(callback) {
-        this.isWebSocket();
-        this.events.Transfer(callback)
-    }
-
-    onApproval(callback) {
-        this.isWebSocket();
-        this.events.Approval(callback)
-    }
-
-    onOwnershipTransferred(callback) {
-        this.isWebSocket();
-        this.events.OwnershipTransferred(callback)
-    }
-
-    onMint(callback) {
-        this.isWebSocket();
-        this.events.Mint(callback)
-    }
-
-    onBurn(callback) {
-        this.isWebSocket();
-        this.events.Burn(callback)
-    }
-
-    onMintFinished(callback) {
-        this.isWebSocket();
-        this.events.MintFinished(callback)
-    }
-
-    onPause(callback) {
-        this.isWebSocket();
-        this.events.Pause(callback)
-    }
-
-    onUnpause(callback) {
-        this.isWebSocket();
-        this.events.Unpause(callback)
     }
 
     async balanceOfAtBlock (holderAddress, blockNumber, callback)  {
@@ -350,7 +660,7 @@ class ERC20Interface extends ContractFactory{
     }
 
     async getBlock (blockNumber, callback) {
-        let [err, events] = await _to(this.contract.contract.getPastEvents('allEvents', {fromBlock: blockNumber, toBlock: blockNumber}));
+        let [err, events] = await _to(this.contract.getPastEvents('allEvents', {fromBlock: blockNumber, toBlock: blockNumber}));
         if(!err) {
             events = events.filter(item => this.supportedEvents.includes(item.event));
             return returnValue(err, events, callback)
@@ -364,167 +674,20 @@ class ERC20Interface extends ContractFactory{
         return returnValue(err, latestBlock.number, callback);
     }
 
-    async methods(method, params, callback) {
-        await this.init();
-        let args = params;
-        if (typeof params === 'string') args = [params];
-        else if (params == null) args = [];
-
-        const [err, result] = await _to(this.contract.methods[method](...args)
-            .send({
-                from: this.wallet,
-                gas: this.gasLimit,
-                gasPrice: this.gasPrice
-            }));
-
-        return returnValue(err, result, callback);
-    }
 }
 
 
-class AccessInterface extends ContractFactory {
-    constructor (nodeAddress, contractAddress,  mnemonic, web3Instance, _abi) {
-        const abi = _abi || monitorChainAbi;
-        super(nodeAddress, contractAddress, abi, mnemonic, web3Instance);
+class AccessInterface extends ContractInterface {
+    constructor (nodeAddress, contractAddress,  mnemonic, web3Instance, _abi, _bytecode) {
+        const abi = _abi || monitor;
+        super(nodeAddress, contractAddress, mnemonic, abi, web3Instance);
+        this.bytecode = _bytecode;
 
-        this.events = this.contract.contract.events;
+        return new Proxy(this, proxyHandler);
     }
 
-    async minDays(callback) {
-        await this.init();
-        const [err, result] = await _to(this.contract.methods.minDays()
-            .call({from: this.wallet}));
-        return returnValue(err, result, callback);
-    }
-
-    async priceForAllPerDay(callback) {
-        await this.init();
-        const [err, result] = await _to(this.contract.methods.priceForAllPerDay()
-            .call({from: this.wallet}));
-        return returnValue(err, result, callback);
-    }
-
-    async pricePerTokenPerDay(callback) {
-        await this.init();
-        const [err, result] = await _to(this.contract.methods.pricePerTokenPerDay()
-            .call({from: this.wallet}));
-        return returnValue(err, result, callback);
-    }
-
-    async getTokenForEventId(eventId, callback) {
-        await this.init();
-        const [err, result] = await _to(this.contract.methods.getTokenForEventId(eventId)
-            .call({from: this.wallet}));
-        return returnValue(err, result, callback);
-    }
-
-    async getTotalStatusCounts(token, callback) {
-        await this.init();
-        const [err, result] = await _to(this.contract.methods.getTotalStatusCounts(
-            toChecksum(token))
-            .call({from: this.wallet}));
-        return returnValue(err, result, callback);
-    }
-
-    async getStatusLevel(tokenAddress, callback) {
-        await this.init();
-        const token = toChecksum(tokenAddress);
-        const [err, result] = await _to(this.contract.methods.getStatusLevel(token)
-            .call({from: this.wallet}));
-        return returnValue(err, result, callback);
-    }
-
-    async getCurrentStatusDetails(tokenAddress, callback) {
-        await this.init();
-        const token = toChecksum(tokenAddress);
-        const [err, result] = await _to(this.contract.methods.getCurrentStatusDetails(token)
-            .call({from: this.wallet}));
-        return returnValue(err, result, callback);
-    }
-
-    async getStatusDetails(tokenAddress, statusNumber, callback) {
-        await this.init();
-        const token = toChecksum(tokenAddress);
-        const [err, result] = await _to(this.contract.methods.getStatusDetails(token, statusNumber)
-            .call({from: this.wallet}));
-        return returnValue(err, result, callback);
-    }
-
-    async getLastStatusDetails(tokenAddress, callback) {
-        await this.init();
-        const token = toChecksum(tokenAddress);
-        const [err, result] = await _to(this.contract.methods.getLastStatusDetails(token)
-            .call({from: this.wallet}));
-        return returnValue(err, result, callback);
-    }
-
-    async subscriptionIsValid(callback) {
-        await this.init();
-        const [err, result] = await _to(this.contract.methods.subscriptionIsValid()
-            .call({from: this.wallet}));
-        return returnValue(err, result, callback);
-    }
-
-    async isExistingSubscriber(callback) {
-        await this.init();
-        const [err, result] = await _to(this.contract.methods.isExistingSubscriber()
-            .call({from: this.wallet}));
-        return returnValue(err, result, callback);
-    }
-
-    async isSubscribedToToken(tokenAddress, callback) {
-        await this.init();
-        const token = toChecksum(tokenAddress);
-        const [err, result] = await _to(this.contract.methods.isSubscribedToToken(token)
-            .call({from: this.wallet}));
-        return returnValue(err, result, callback);
-    }
-
-    async canAccessToken(tokenAddress, callback) {
-        await this.init();
-        const token = toChecksum(tokenAddress);
-        const [err, result] = await _to(this.contract.methods.canAccessToken(token)
-            .call({from: this.wallet}));
-        return returnValue(err, result, callback);
-    }
-
-    async getNumberSupportedTokens(callback) {
-        await this.init();
-        const [err, result] = await _to(this.contract.methods.getNumberSupportedTokens()
-            .call({from: this.wallet}));
-        return returnValue(err, result, callback);
-    }
-
-    async getAllSupportedTokens(callback) {
-        await this.init();
-        const [err, result] = await _to(this.contract.methods.getAllSupportedTokens()
-            .call({from: this.wallet}));
-        return returnValue(err, result, callback);
-    }
-
-    async remainingSubscriptionDays(callback) {
-        await this.init();
-        const [err, result] = await _to(this.contract.methods.remainingSubscriptionDays()
-            .call({from: this.wallet}));
-        return returnValue(err, result, callback);
-    }
-
-    async unsubscribe(callback) {
-        await this.init();
-        const [err, result] = await _to(this.contract.methods.unsubscribe()
-            .send({
-                from: this.wallet,
-                gas: this.gasLimit,
-                gasPrice: this.gasPrice
-            }));
-        return returnValue(err, result, callback);
-    }
-
-    async calculatePrice(numberOfDays, numberTokens, callback) {
-        await this.init();
-        const [err, result] = await _to(this.contract.methods.calculatePrice(numberOfDays, numberTokens)
-            .call({from: this.wallet}));
-        return returnValue(err, result, callback);
+    static web3 (web3Instance, contractAddress, abi) {
+        return new AccessInterface(null, contractAddress, null, web3Instance, abi)
     }
 
     async subscribe(tokenAddresses, numberOfDays, accessAddress, weiAmount, callback) {
@@ -563,14 +726,16 @@ class AccessInterface extends ContractFactory {
         amount = amount.toString();
 
         const tokens = tokenAddresses.map(toChecksum);
+        const gasPrice = this.gasPrice || await this.getGasPrice();
 
         [err, result] = await _to(this.contract.methods.subscribe(address, days, tokens)
             .send({
                 from: this.wallet,
                 gas: this.gasLimit,
-                gasPrice: this.gasPrice,
+                gasPrice: gasPrice,
                 value: amount
             }));
+        if(result) transactions.updateStat(result.gasUsed, gasPrice);
         return returnValue(err, result, cb);
     }
 
@@ -595,21 +760,16 @@ class AccessInterface extends ContractFactory {
         if (amount.lt(bn(toPay))) {
             throw (`Not enough wei to pay. The minimum required amount is ${toPay}`);
         }
+        const gasPrice = this.gasPrice || await this.getGasPrice();
 
         [err, result] = await _to(this.contract.methods.subscribeAll(address, days)
             .send({
                 from: this.wallet,
                 gas: this.gasLimit,
-                gasPrice: this.gasPrice,
+                gasPrice: gasPrice,
                 value: amount.toString()
             }));
-        return returnValue(err, result, callback);
-    }
-
-    async getSubscriptionData(callback) {
-        await this.init();
-        const [err, result] = await _to(this.contract.methods.getSubscriptionData()
-            .call({from: this.wallet}));
+        if(result) transactions.updateStat(result.gasUsed, gasPrice);
         return returnValue(err, result, callback);
     }
 
@@ -637,25 +797,9 @@ class AccessInterface extends ContractFactory {
 
         let res;
         [err, res] = await _to(this.subscribe(tokensList, numberOfDays, accessAddress, weiAmount));
+        if(result) transactions.updateStat(res.gasUsed, gasPrice);
         return returnValue(err, res, callback);
     }
-
-    async isAddressBlocked(token, addressToCheck, callback) {
-        await this.init();
-        const [err, result] = await _to(this.contract.methods.isAddressBlocked(
-            toChecksum(token),
-            toChecksum(addressToCheck))
-            .call({from: this.wallet}));
-        return returnValue(err, result, callback);
-    }
-
-    onStatusChanged(callback) {
-        if (!['ws', 'wss'].includes(this.protocol))
-            throw `Invalid protocol type - '${this.protocol}'! ` +
-            `Only the 'ws://' and 'wss://' protocols support listening for events.\n`;
-        this.events.TokenStatusChanged(callback);
-    }
-
 }
 
 module.exports = {
