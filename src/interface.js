@@ -803,6 +803,7 @@ class AccessInterface extends ContractInterface {
 }
 
 module.exports = {
+    ContractInterface,
     AccessInterface,
     ERC20Interface,
     Web3

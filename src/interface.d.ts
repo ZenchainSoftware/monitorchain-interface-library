@@ -46,7 +46,7 @@ declare class ContractInterface {
 }
 
 export declare class ERC20Interface extends ContractInterface {
-    constructor(nodeAddress: URL, contractAddress: string, mnemonic?: string, web3Instance?: new () => Web3js.default, abi?: ABIDefinition);
+    constructor(nodeAddress: URL, contractAddress: string, mnemonic?: string, web3Instance?: new () => Web3js.default, abi?: ABIDefinition, bytecode?: string);
     static web3(web3Instance: new () => Web3js.default, contractAddress: string, abi: ABIDefinition): ERC20Interface;
 
     info: {
@@ -69,7 +69,7 @@ export declare class ERC20Interface extends ContractInterface {
     transfer(to: string, value: string | number, callback?: Callback<void>): void;
     transferFrom(from: string, to: string, value: string | number, callback?: Callback<void>): void;
     approve(spender: string, value: string | number, callback?: Callback<void>): void;
-    allowance(owner: string, spender: string, value: string | number, callbck?: Callback<void>): void;
+    allowance(owner: string, spender: string): string;
     tokenInfo(callback?: Callback<TokenInfo>): TokenInfo;
     onEvent(callback?: Callback<EventLog>): EventLog;
     onTransfer(callback?: Callback<EventLog>): EventLog;
@@ -84,7 +84,7 @@ export declare class ERC20Interface extends ContractInterface {
 
 
 export declare class AccessInterface extends ContractInterface {
-    constructor(nodeAddress: URL, contractAddress: string, mnemonic?: string, web3Instance?: new () => Web3js.default, abi?: ABIDefinition);
+    constructor(nodeAddress: URL, contractAddress: string, mnemonic?: string, web3Instance?: new () => Web3js.default, abi?: ABIDefinition, bytecode?: string);
     static web3(web3Instance: new () => Web3js.default, contractAddress: string, abi: ABIDefinition): AccessInterface;
 
     minDays(callback?: Callback<number>): Promise<number>;
